@@ -9,7 +9,7 @@ use async_channel::{self as channel, Receiver, Sender};
 use futures::future::try_join_all;
 use futures_lite::FutureExt;
 use tokio::sync::{RwLock, oneshot};
-use tokio::task;
+use tokio::task::{self, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -21,6 +21,7 @@ use crate::download::{download_known_post_messages_without_pre_message, download
 use crate::ephemeral;
 use crate::events::EventType;
 use crate::imap::{Imap, session::Session};
+use crate::keyupdate::{maybe_send_keyupdate_message, schedule_keyupdate_check};
 use crate::location;
 use crate::log::{LogExt, warn};
 use crate::reaction::broadcast_reactions::maybe_broadcast_reactions;
@@ -281,6 +282,60 @@ impl SchedulerState {
             scheduler.interrupt_recently_seen(contact_id, timestamp);
         }
     }
+
+    /// Fetches from all transports at once, each on a dedicated connection,
+    /// with I/O paused so that the scheduler does not connect as well.
+    ///
+    /// Returns as soon as one transport fetched messages:
+    /// the others then fetch nothing more and are dropped,
+    /// so that a caller woken up by a push notification
+    /// does not wait for a transport that may never answer.
+    pub(crate) async fn background_fetch_any(&self, context: &Context) -> Result<()> {
+        let _pause_guard = self.pause(context).await?;
+
+        let stop_token = CancellationToken::new();
+        let mut set = JoinSet::new();
+        for (transport_id, param) in ConfiguredLoginParam::load_all(context).await? {
+            let context = context.clone();
+            let stop_token = stop_token.clone();
+            set.spawn(async move {
+                match background_fetch_from_transport(&context, transport_id, param, stop_token)
+                    .await
+                {
+                    Ok(fetched) => fetched,
+                    Err(err) => {
+                        warn!(context, "Transport {transport_id}: fetch failed: {err:#}.");
+                        false
+                    }
+                }
+            });
+        }
+
+        while let Some(fetched) = set.join_next().await {
+            if let Ok(true) = fetched {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn background_fetch_from_transport(
+    context: &Context,
+    transport_id: u32,
+    param: ConfiguredLoginParam,
+    stop_token: CancellationToken,
+) -> Result<bool> {
+    // A single fetch has nothing to interrupt.
+    let (_, idle_interrupt_receiver) = channel::bounded(1);
+    let mut connection = Imap::new(context, transport_id, param, idle_interrupt_receiver).await?;
+    connection.background_fetch_stop_token = Some(stop_token);
+    let mut session = connection.prepare(context).await?;
+
+    let folder = connection.folder.clone();
+    connection
+        .fetch_move_delete(context, &mut session, &folder)
+        .await
 }
 
 #[derive(Debug, Default)]
@@ -324,9 +379,6 @@ struct SchedBox {
 
     /// IMAP loop task handle.
     handle: task::JoinHandle<()>,
-
-    /// Relay published status.
-    is_published: bool,
 }
 
 /// Job and connection scheduler.
@@ -573,6 +625,9 @@ async fn smtp_loop(
             return;
         }
 
+        // Reschedule the check to catch changes lost to a restart.
+        schedule_keyupdate_check(&ctx).await.log_err(&ctx).ok();
+
         let mut timeout = None;
         loop {
             if let Err(err) = send_smtp_messages(&ctx, &mut connection).await {
@@ -626,8 +681,29 @@ async fn smtp_loop(
                     slept.saturating_add(rand::random_range((slept / 2)..=slept)),
                 ));
             } else {
+                // Queue is drained: send a due keyupdate without delaying real messages.
+                let next_check = ctx.next_keyupdate_check.load(Ordering::Relaxed);
+                let wait = u64::try_from(next_check.saturating_sub(time())).unwrap_or_default();
+                if next_check != 0 && wait == 0 {
+                    // Clear first so that an intervening transport change schedules a new check.
+                    ctx.next_keyupdate_check.store(0, Ordering::Relaxed);
+                    maybe_send_keyupdate_message(&ctx)
+                        .await
+                        .context("Failed to send keyupdate message")
+                        .log_err(&ctx)
+                        .ok();
+                    continue;
+                }
+
                 info!(ctx, "SMTP has no messages to retry, waiting for interrupt.");
-                idle_interrupt_receiver.recv().await.unwrap_or_default();
+                let interrupt = idle_interrupt_receiver.recv();
+                if next_check != 0 {
+                    tokio::time::timeout(std::time::Duration::from_secs(wait), interrupt)
+                        .await
+                        .ok();
+                } else {
+                    interrupt.await.ok();
+                }
             };
 
             info!(ctx, "SMTP fake idle interrupted.")
@@ -655,9 +731,7 @@ impl Scheduler {
         let mut inboxes = Vec::new();
         let mut start_recvs = Vec::new();
 
-        for (transport_id, configured_login_param, is_published) in
-            ConfiguredLoginParam::load_all(ctx).await?
-        {
+        for (transport_id, configured_login_param) in ConfiguredLoginParam::load_all(ctx).await? {
             let (conn_state, inbox_handlers) =
                 ImapConnectionState::new(ctx, transport_id, configured_login_param.clone()).await?;
             let (inbox_start_send, inbox_start_recv) = oneshot::channel();
@@ -674,7 +748,6 @@ impl Scheduler {
                 folder,
                 conn_state,
                 handle,
-                is_published,
             };
             inboxes.push(inbox);
             start_recvs.push(inbox_start_recv);

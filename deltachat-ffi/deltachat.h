@@ -526,9 +526,10 @@ int             dc_set_config                (dc_context_t* context, const char*
  *
  * - `sys.version` = get the version string e.g. as `1.2.3` or as `1.2.3special4`.
  * - `sys.msgsize_max_recommended` = maximal recommended attachment size in bytes.
- *                    All possible overheads are already subtracted and this value can be used e.g. for direct comparison
- *                    with the size of a file the user wants to attach. If an attachment is larger than this value,
- *                    an error (no warning as it should be shown to the user) is logged but the attachment is sent anyway.
+ *                    All possible overheads are already subtracted and this value can be used
+ *                    e.g. for direct comparison with the size of a file the user wants to attach.
+ *                    If an attachment is larger than this value, the message is sent anyway,
+ *                    but email servers are likely to reject the message when receiving it or before trying to send.
  * - `sys.config_keys` = get a space-separated list of all config-keys available.
  *                    The config-keys are the keys that can be passed to the parameter `key` of this function.
  *
@@ -3200,19 +3201,22 @@ void           dc_accounts_maybe_network_lost    (dc_accounts_t* accounts);
 
 /**
  * Perform a background fetch for all accounts in parallel with a timeout.
- * Pauses the scheduler, fetches messages from imap and then resumes the scheduler.
+ * Pauses the scheduler, fetches from all transports at once and then resumes the scheduler.
+ * The fetch for an account ends as soon as one of its transports received messages.
  *
  * dc_accounts_background_fetch() was created for the iOS Background fetch.
  *
- * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end
- * even in case of timeout, unless the function fails and returns 0.
+ * The `DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE` event is emitted at the end,
+ * also on timeout, when another background fetch is already running
+ * and when the call is ignored because the timeout is too small,
+ * so it is safe to wait for the event whenever `accounts` is not NULL.
  * Process all events until you get this one and you can safely return to the background
  * without forgetting to create notifications caused by timing race conditions.
  *
  * @memberof dc_accounts_t
  * @param accounts The account manager as created by dc_accounts_new().
  * @param timeout The timeout in seconds
- * @return Return 1 if DC_EVENT_ACCOUNTS_BACKGROUND_FETCH_DONE was emitted and 0 otherwise.
+ * @return Return 0 if the call was ignored because `accounts` is NULL or the timeout is too small, 1 otherwise.
  */
 int            dc_accounts_background_fetch    (dc_accounts_t* accounts, uint64_t timeout);
 
@@ -6376,11 +6380,14 @@ void dc_event_unref(dc_event_t* event);
 #define DC_EVENT_WEBXDC_REALTIME_ADVERTISEMENT    2151
 
 /**
- * Tells that the Background fetch was completed (or timed out).
+ * Tells that a call to dc_accounts_background_fetch() is done:
+ * the fetch completed, timed out, was stopped or was not started.
  *
- * This event acts as a marker, when you reach this event you can be sure
- * that all events emitted during the background fetch were processed.
- * 
+ * For the call that started the fetch, this event acts as a marker:
+ * when you reach it, all events emitted during the fetch were processed.
+ * A call made while another background fetch is running gets the event immediately,
+ * and the running fetch keeps emitting events until its own marker.
+ *
  * This event is only emitted by the account manager
  */
 
@@ -6476,7 +6483,7 @@ void dc_event_unref(dc_event_t* event);
 
 /**
  * An incoming or outgoing call was ended using dc_end_call() on this or another device, by caller or callee.
- * Moreover, the event is sent when the call was not accepted within 1 minute timeout.
+ * Moreover, the event is sent when the call was not accepted within two minutes.
  *
  * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
  *
@@ -6488,9 +6495,10 @@ void dc_event_unref(dc_event_t* event);
  * Transport relay added/deleted or default has changed.
  * UI should update the list.
  *
- * The event is emitted when the transports are modified on another device
- * using the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`, `delete_transport`,
- * `set_transport_unpublished` or `set_config(configured_addr)`.
+ * The event is emitted on the device modifying the transports
+ * as well as on other devices applying the synced change,
+ * for the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`,
+ * `delete_transport` or `set_config(configured_addr)`.
  */
 #define DC_EVENT_TRANSPORTS_MODIFIED           2600
 
@@ -6686,10 +6694,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used as the name for the corresponding chatlist entry.
 #define DC_STR_ARCHIVEDCHATS              40
 
-/// "Cannot login as %1$s."
-///
-/// Used in error strings.
-/// - %1$s will be replaced by the failing login name
+/// @deprecated 2026-08-24
 #define DC_STR_CANNOT_LOGIN               60
 
 /// "Location streaming enabled."
@@ -7299,11 +7304,7 @@ void dc_event_unref(dc_event_t* event);
 /// "Message pinned by %1$s."
 #define DC_STR_MESSAGE_PINNED_BY_OTHER 244
 
-/// "Phasing out"
-///
-/// Used in connectivity view to flag unpublished relays.
-/// This should match the wording used for relay deletion confirmation,
-/// saying "Before deletion, it will be gradually phased out so your contacts can switch over smoothly"
+/// @deprecated 2026-08-31
 #define DC_STR_PHASING_OUT 245
 
 /**

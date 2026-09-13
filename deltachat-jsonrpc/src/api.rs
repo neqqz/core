@@ -17,7 +17,6 @@ use deltachat::chat::{
 };
 use deltachat::chatlist::Chatlist;
 use deltachat::config::{Config, get_all_ui_config_keys};
-use deltachat::constants::DC_MSG_ID_DAYMARKER;
 use deltachat::contact::{Contact, ContactId, Origin, may_be_valid_addr};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
@@ -67,7 +66,6 @@ use self::types::{
 };
 use crate::api::types::appversions::JsonrpcAppSource;
 use crate::api::types::chat_list::{ChatListItemFetchResult, get_chat_list_item_by_id};
-use crate::api::types::login_param::TransportListEntry;
 use crate::api::types::qr::{QrObject, SecurejoinSource, SecurejoinUiPath};
 
 #[derive(Debug)]
@@ -156,7 +154,7 @@ impl CommandApi {
     }
 }
 
-#[rpc(all_positional, ts_outdir = "typescript/generated")]
+#[rpc(all_positional)]
 impl CommandApi {
     /// Test function.
     async fn sleep(&self, delay: f64) {
@@ -281,7 +279,8 @@ impl CommandApi {
 
     /// Performs a background fetch for all accounts in parallel with a timeout.
     ///
-    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout.
+    /// The `AccountsBackgroundFetchDone` event is emitted at the end even in case of timeout,
+    /// and immediately if another background fetch is already running.
     /// Process all events until you get this one and you can safely return to the background
     /// without forgetting to create notifications caused by timing race conditions.
     async fn background_fetch(&self, timeout_in_seconds: f64) -> Result<()> {
@@ -504,8 +503,7 @@ impl CommandApi {
     /// - [Self::add_transport_from_qr()] to add a transport
     ///   from a server encoded in a QR code.
     /// - [Self::list_transports()] to get a list of all configured transports.
-    /// - [Self::set_transport_unpublished()] to remove a transport.
-    /// - [Self::set_transport_unpublished()] to set whether contacts see this transport.
+    /// - [Self::delete_transport()] to remove a transport.
     async fn add_or_update_transport(
         &self,
         account_id: u32,
@@ -530,32 +528,8 @@ impl CommandApi {
 
     /// Returns the list of all email accounts that are used as a transport in the current profile.
     /// Use [Self::add_or_update_transport()] to add or change a transport
-    /// and [Self::set_transport_unpublished()] to remove a transport.
+    /// and [Self::delete_transport()] to remove a transport.
     async fn list_transports(&self, account_id: u32) -> Result<Vec<EnteredLoginParam>> {
-        let ctx = self.get_context(account_id).await?;
-        let res = ctx
-            .list_transports()
-            .await?
-            .into_iter()
-            .filter(|t| !t.is_unpublished)
-            .map(|t| t.param.into())
-            .collect();
-        Ok(res)
-    }
-
-    /// Deprecated 2026-06: This is not needed by UI implementations anymore,
-    /// because unpublished relays now count as removed from the user point of view,
-    /// and must not be shown in the list of relays.
-    /// This means that UIs should use `list_transports()` instead of this function.
-    ///
-    /// Returns the list of all email accounts that are used as a transport in the current profile.
-    ///
-    /// As opposed to `list_transports()`, this function also returns unpublished transports,
-    /// and for each returned transport it returns the information whether or not is `unpublished`.
-    ///
-    /// Use [Self::add_or_update_transport()] to add or change a transport
-    /// and [Self::set_transport_unpublished()] to change whether a transport is 'published'.
-    async fn list_transports_ex(&self, account_id: u32) -> Result<Vec<TransportListEntry>> {
         let ctx = self.get_context(account_id).await?;
         let res = ctx
             .list_transports()
@@ -566,39 +540,15 @@ impl CommandApi {
         Ok(res)
     }
 
-    /// Immediately deletes a transport, potentially causing messages not to arrive.
-    /// This must ONLY be used by the automated tests.
-    /// UI implementations must use [`Self::set_transport_unpublished`] instead.
+    /// Removes a transport.
+    /// UIs should call this function when the user removes a relay.
+    ///
+    /// The last transport cannot be removed.
+    /// If the removed transport was the one used for sending,
+    /// another one is chosen automatically.
     async fn delete_transport(&self, account_id: u32, addr: String) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         ctx.delete_transport(&addr).await
-    }
-
-    /// Change whether the transport is unpublished.
-    /// UIs should call this function when the user clicks on "Remove".
-    /// Core will keep listening on this transport for some time,
-    /// and automatically remove it once it is no longer needed.
-    ///
-    /// Unpublished transports are not advertised to contacts,
-    /// and self-sent messages are not sent there,
-    /// so that we don't cause extra messages to the corresponding inbox,
-    /// but can still receive messages from contacts who don't know our new transport addresses yet.
-    ///
-    /// When more transports are added by [`Self::add_or_update_transport()`] or [`Self::add_transport_from_qr`],
-    /// the least recently needed unpublished transport is automatically removed
-    /// if this is necessary in order to stay below the maximum number of allowed relays.
-    /// Also, unpublished transports that are not used to receive any new messages for a time defined by
-    /// [`UNPUBLISHED_TRANSPORT_KEEP_TIME`] are automatically removed.
-    ///
-    /// [`UNPUBLISHED_TRANSPORT_KEEP_TIME`]: deltachat::sql::UNPUBLISHED_TRANSPORT_KEEP_TIME
-    async fn set_transport_unpublished(
-        &self,
-        account_id: u32,
-        addr: String,
-        unpublished: bool,
-    ) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        ctx.set_transport_unpublished(&addr, unpublished).await
     }
 
     /// Signal an ongoing process to stop.
@@ -1396,7 +1346,7 @@ impl CommandApi {
     ///
     /// * chat_id The chat ID of which the messages IDs should be queried.
     /// * _info_only: Deprecated, pass `false` here.
-    /// * `add_daymarker` - If `true`, add day markers as `DC_MSG_ID_DAYMARKER` to the result,
+    /// * `add_daymarker` - If `true`, add day markers as `MsgId::DAYMARKER` to the result,
     ///   e.g. [1234, 1237, 9, 1239]. The day marker timestamp is the midnight one for the
     ///   corresponding (following) day in the local timezone.
     async fn get_message_ids(
@@ -1418,7 +1368,7 @@ impl CommandApi {
             .map(|chat_item| -> u32 {
                 match chat_item {
                     deltachat::chat::ChatItem::Message { msg_id } => msg_id.to_u32(),
-                    deltachat::chat::ChatItem::DayMarker { .. } => DC_MSG_ID_DAYMARKER,
+                    deltachat::chat::ChatItem::DayMarker { .. } => MsgId::DAYMARKER.to_u32(),
                 }
             })
             .collect())
@@ -2126,6 +2076,14 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Waits until all transports are idle or failed and no background work is left.
+    /// Never returns unless I/O is started. Must ONLY be used by tests.
+    async fn wait_for_all_work_done(&self, account_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.wait_for_all_work_done().await;
+        Ok(())
+    }
+
     /// Get the current connectivity, i.e. whether the device is connected to the IMAP server.
     /// One of:
     /// - DC_CONNECTIVITY_NOT_CONNECTED (1000): Show e.g. the string "Not connected" or a red dot
@@ -2315,6 +2273,9 @@ impl CommandApi {
     /// Get blob encoded as base64 from a webxdc message
     ///
     /// path is the path of the file within webxdc archive
+    ///
+    /// If the file is `icon.png` or `icon.jpg`,
+    /// loading it may fail if dimensions are unexpectedly large.
     async fn get_webxdc_blob(
         &self,
         account_id: u32,
@@ -2495,6 +2456,7 @@ impl CommandApi {
     }
 
     /// Returns reactions to the message.
+    /// `None` when there are no reactions.
     async fn get_message_reactions(
         &self,
         account_id: u32,
@@ -2858,6 +2820,15 @@ impl CommandApi {
                 .await?
                 .map(JsonrpcAppSource::from_core_type),
         )
+    }
+
+    /// Returns true if all accounts have empty outgoing message queue.
+    ///
+    /// This API is intended to be used by UIs
+    /// to request that operating system does not put the application in background
+    /// while there are still outgoing messages that are not sent out.
+    async fn is_sending_finished(&self) -> Result<bool> {
+        self.accounts.read().await.is_sending_finished().await
     }
 }
 

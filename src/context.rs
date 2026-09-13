@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -16,11 +16,11 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::chat::{ChatId, get_chat_cnt};
 use crate::config::Config;
-use crate::constants::{self, DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT, DC_VERSION_STR};
+use crate::constants::{self, DC_VERSION_STR};
 use crate::contact::{Contact, ContactId};
 use crate::debug_logging::DebugLogging;
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::imap::{Imap, ServerMetadata};
+use crate::imap::ServerMetadata;
 use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::message::{self, MessageState, MsgId};
@@ -231,8 +231,6 @@ pub struct InnerContext {
     /// This is a global mutex-like state for operations which should be modal in the
     /// clients.
     running_state: RwLock<RunningState>,
-    /// Mutex to prevent a race condition when a "your pw is wrong" warning is sent, resulting in multiple messages being sent.
-    pub(crate) wrong_pw_warning_mutex: Mutex<()>,
     /// Mutex to prevent running housekeeping or relay management from multiple threads at once.
     pub(crate) background_task_mutex: Mutex<()>,
 
@@ -329,9 +327,12 @@ pub struct InnerContext {
     /// Mutex is also held while generating the key to avoid generating the key twice.
     pub(crate) self_public_key: Mutex<Option<SignedPublicKey>>,
 
-    /// `Connectivity` values for published relays, unordered. Used to compute the aggregate connectivity,
+    /// `Connectivity` values for the relays, unordered. Used to compute the aggregate connectivity,
     /// see [`Context::get_connectivity()`].
-    pub(crate) published_connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
+    pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
+
+    /// Timestamp after which the SMTP loop checks for a keyupdate to send, or 0 if none is due.
+    pub(crate) next_keyupdate_check: AtomicI64,
 }
 
 /// The state of ongoing process.
@@ -486,7 +487,6 @@ impl Context {
             blobdir,
             running_state: RwLock::new(Default::default()),
             sql: Sql::new(dbfile),
-            wrong_pw_warning_mutex: Mutex::new(()),
             background_task_mutex: Mutex::new(()),
             fetch_msgs_mutex: Mutex::new(()),
             translated_stockstrings: stockstrings,
@@ -508,7 +508,8 @@ impl Context {
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
             self_public_key: Mutex::new(None),
-            published_connectivities: parking_lot::Mutex::new(Vec::new()),
+            connectivities: parking_lot::Mutex::new(Vec::new()),
+            next_keyupdate_check: AtomicI64::new(0),
         };
 
         let ctx = Context {
@@ -598,11 +599,11 @@ impl Context {
         Ok(constants::DEFAULT_MAX_SMTP_RCPT_TO)
     }
 
-    /// Does a single round of fetching from IMAP and returns.
+    /// Does a single round of fetching messages from all transports and returns.
     ///
     /// Can be used even if I/O is currently stopped.
-    /// If I/O is currently stopped, starts a new IMAP connection
-    /// and fetches from Inbox and DeltaChat folders.
+    /// If I/O is stopped, fetches over a dedicated connection per transport
+    /// and returns as soon as one of them fetched messages.
     pub async fn background_fetch(&self) -> Result<()> {
         if !(self.is_configured().await?) {
             return Ok(());
@@ -613,46 +614,19 @@ impl Context {
             return Ok(());
         }
 
-        let address = self.get_primary_self_addr().await?;
         let time_start = tools::Time::now();
-        info!(self, "background_fetch started fetching {address}.");
+        info!(self, "background_fetch started.");
 
         if self.scheduler.is_running().await {
             self.scheduler.maybe_network().await;
             self.wait_for_all_work_done().await;
         } else {
-            // Pause the scheduler to ensure another connection does not start
-            // while we are fetching on a dedicated connection.
-            let _pause_guard = self.scheduler.pause(self).await?;
-
-            // Start a new dedicated connection.
-            let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
-            let mut session = connection.prepare(self).await?;
-
-            // Fetch IMAP folders.
-            let folder = connection.folder.clone();
-            connection
-                .fetch_move_delete(self, &mut session, &folder)
-                .await?;
-
-            // Update quota (to send warning if full) - but only check it once in a while.
-            // note: For now this only checks quota of primary transport,
-            // because background check only checks primary transport at the moment
-            if self
-                .quota_needs_update(
-                    session.transport_id(),
-                    DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT,
-                )
-                .await
-                && let Err(err) = self.update_recent_quota(&mut session, &folder).await
-            {
-                warn!(self, "Failed to update quota: {err:#}.");
-            }
+            self.scheduler.background_fetch_any(self).await?;
         }
 
         info!(
             self,
-            "background_fetch done for {address} took {:?}.",
+            "background_fetch done, took {:?}.",
             time_elapsed(&time_start),
         );
 
@@ -845,7 +819,7 @@ impl Context {
         let all_transports: Vec<String> = ConfiguredLoginParam::load_all(self)
             .await?
             .into_iter()
-            .map(|(transport_id, param, _)| format!("{transport_id}: {param}"))
+            .map(|(transport_id, param)| format!("{transport_id}: {param}"))
             .collect();
         let all_transports = if all_transports.is_empty() {
             "Not configured".to_string()
@@ -1055,20 +1029,24 @@ impl Context {
                 .to_string(),
         );
         res.insert(
-            "last_automatic_relay_management",
-            self.get_config_i64(Config::LastAutomaticRelayManagement)
+            "last_autorelay",
+            self.get_config_i64(Config::LastAutorelay)
                 .await?
                 .to_string(),
         );
         res.insert(
-            "automatic_relay_management",
-            self.get_config_bool(Config::AutomaticRelayManagement)
+            "autorelay",
+            self.get_config_bool(Config::Autorelay).await?.to_string(),
+        );
+        res.insert(
+            "autorelay_finished",
+            self.get_config_bool(Config::AutorelayFinished)
                 .await?
                 .to_string(),
         );
         res.insert(
-            "automatic_relay_management_finished",
-            self.get_config_bool(Config::AutomaticRelayManagementFinished)
+            "keyupdate_debounce",
+            self.get_config_int(Config::KeyupdateDebounce)
                 .await?
                 .to_string(),
         );

@@ -6,8 +6,6 @@ use deltachat_derive::{FromSql, ToSql};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 
-use crate::chat::ChatId;
-
 pub static DC_VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 
 /// Set of characters to percent-encode in email addresses and names.
@@ -70,15 +68,6 @@ pub(crate) const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
 // "90 days" has proven to be too short at some point (user were informed but there was no update)
 pub(crate) const DC_OUTDATED_WARNING_DAYS: i64 = 183;
 
-/// messages that should be deleted get this chat_id; the messages are deleted from the working thread later then. This is also needed as rfc724_mid should be preset as long as the message is not deleted on the server (otherwise it is downloaded again)
-pub const DC_CHAT_ID_TRASH: ChatId = ChatId::new(3);
-/// only an indicator in a chatlist
-pub const DC_CHAT_ID_ARCHIVED_LINK: ChatId = ChatId::new(6);
-/// only an indicator in a chatlist
-pub const DC_CHAT_ID_ALLDONE_HINT: ChatId = ChatId::new(7);
-/// larger chat IDs are "real" chats, their messages are "real" messages.
-pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
-
 /// Chat type.
 #[derive(
     Debug,
@@ -101,7 +90,7 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 pub enum Chattype {
     /// A single chat (a chat with a single contact).
     ///
-    /// Created by [`ChatId::create_for_contact`].
+    /// Created by [`crate::chat::ChatId::create_for_contact`].
     Single = 100,
 
     /// Group chat.
@@ -141,9 +130,6 @@ pub enum Chattype {
     InBroadcast = 165,
 }
 
-pub const DC_MSG_ID_DAYMARKER: u32 = 9;
-pub const DC_MSG_ID_LAST_SPECIAL: u32 = 9;
-
 /// String that indicates that something is left out or truncated.
 pub(crate) const DC_ELLIPSIS: &str = "[...]";
 // how many lines desktop can display when fullscreen (fullscreen at zoomlevel 1x)
@@ -162,8 +148,9 @@ pub const DC_DESIRED_TEXT_LINE_LEN: usize = 100;
 /// `char`s), not Unicode Grapheme Clusters.
 pub const DC_DESIRED_TEXT_LEN: usize = DC_DESIRED_TEXT_LINE_LEN * DC_DESIRED_TEXT_LINES;
 
-// max. weight of images to send w/o recoding
-pub const BALANCED_IMAGE_BYTES: usize = 500_000;
+/// max. weight of images to send w/o recoding.
+// this is an estimation to the size we get when recoding high detail images.
+pub const BALANCED_IMAGE_BYTES: usize = 940_000;
 pub const WORSE_IMAGE_BYTES: usize = 130_000;
 
 // max. width/height and bytes of an avatar
@@ -173,7 +160,7 @@ pub(crate) const WORSE_AVATAR_SIZE: u32 = 256;
 pub(crate) const WORSE_AVATAR_BYTES: usize = 20_000; // this also fits to Outlook servers don't allowing headers larger than 32k.
 
 // max. width/height of images scaled down because of being too huge
-pub const BALANCED_IMAGE_SIZE: u32 = 1280;
+pub const BALANCED_IMAGE_SIZE: u32 = 1760;
 pub const WORSE_IMAGE_SIZE: u32 = 640;
 
 /// Limit for received images size. Bigger images become `Viewtype::File` to avoid excessive memory
@@ -184,9 +171,6 @@ pub const MAX_RCVD_IMAGE_PIXELS: u32 = 50_000_000;
 // recipient lists exceeding the limit are sent in chunks.
 // Relays typically advertise their limit via IMAP METADATA.
 pub(crate) const DEFAULT_MAX_SMTP_RCPT_TO: u32 = 50;
-
-/// How far the last quota check needs to be in the past to be checked by the background function (in seconds).
-pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; // 12 hours
 
 /// How far in the future the sender timestamp of a message is allowed to be, in seconds. Also used
 /// in the group membership consistency algo to reject outdated membership changes.

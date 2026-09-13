@@ -19,6 +19,7 @@ use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
 use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
 use ratelimit::Ratelimit;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::chat::{self, add_device_msg};
@@ -28,7 +29,6 @@ use crate::context::Context;
 use crate::ensure_and_debug_assert;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::log::LogExt;
 use crate::log::warn;
 use crate::message::{self, Message};
 use crate::mimeparser;
@@ -37,7 +37,6 @@ use crate::net::session::SessionStream;
 use crate::push::encrypt_device_token;
 use crate::receive_imf::{ReceivedMsg, from_field_to_contact_id, receive_imf_inner};
 use crate::scheduler::connectivity::ConnectivityStore;
-use crate::stock_str;
 use crate::tools::{self, create_id, duration_to_str, time};
 use crate::transport::{
     ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
@@ -87,8 +86,6 @@ pub(crate) struct Imap {
     /// Watched folder.
     pub(crate) folder: String,
 
-    authentication_failed_once: bool,
-
     pub(crate) connectivity: ConnectivityStore,
 
     conn_last_try: tools::Time,
@@ -108,6 +105,10 @@ pub(crate) struct Imap {
 
     /// IMAP UID resync request receiver.
     pub(crate) resync_request_receiver: async_channel::Receiver<()>,
+
+    /// The background fetch is cancelled once messages are fetched from one of the transports,
+    /// so that the other transports fetch nothing.
+    pub(crate) background_fetch_stop_token: Option<CancellationToken>,
 }
 
 #[derive(Debug, Default)]
@@ -234,7 +235,6 @@ impl Imap {
             proxy_config,
             strict_tls,
             folder,
-            authentication_failed_once: false,
             connectivity: Default::default(),
             conn_last_try: UNIX_EPOCH,
             conn_backoff_ms: 0,
@@ -242,19 +242,8 @@ impl Imap {
             ratelimit: Ratelimit::new(Duration::new(120, 0), 2.0),
             resync_request_sender,
             resync_request_receiver,
+            background_fetch_stop_token: None,
         })
-    }
-
-    /// Creates new disconnected IMAP client using configured parameters.
-    pub async fn new_configured(
-        context: &Context,
-        idle_interrupt_receiver: Receiver<()>,
-    ) -> Result<Self> {
-        let (transport_id, param) = ConfiguredLoginParam::load(context)
-            .await?
-            .context("Not configured")?;
-        let imap = Self::new(context, transport_id, param, idle_interrupt_receiver).await?;
-        Ok(imap)
     }
 
     /// Returns transport ID of the IMAP client.
@@ -267,11 +256,7 @@ impl Imap {
     /// Calling this function is not enough to perform IMAP operations. Use [`Imap::prepare`]
     /// instead if you are going to actually use connection rather than trying connection
     /// parameters.
-    pub(crate) async fn connect(
-        &mut self,
-        context: &Context,
-        configuring: bool,
-    ) -> Result<Session> {
+    pub(crate) async fn connect(&mut self, context: &Context) -> Result<Session> {
         let now = tools::Time::now();
         let until_can_send = max(
             min(self.conn_last_try, now)
@@ -342,7 +327,10 @@ impl Imap {
             let imap_pw: &str = &self.password;
 
             info!(context, "Logging into IMAP server with LOGIN.");
-            let login_res = client.login(imap_user, imap_pw).await;
+            let login_res = client
+                .login(imap_user, imap_pw)
+                .await
+                .with_context(|| format!("IMAP failed to login as {imap_user}"));
 
             match login_res {
                 Ok((mut session, login_capabilities_opt)) => {
@@ -395,7 +383,6 @@ impl Imap {
                     let mut lock = context.server_id.write().await;
                     lock.clone_from(&session.capabilities.server_id);
 
-                    self.authentication_failed_once = false;
                     context.emit_event(EventType::ImapConnected(format!(
                         "IMAP-LOGIN as {}",
                         lp.user
@@ -406,42 +393,8 @@ impl Imap {
                 }
 
                 Err(err) => {
-                    let imap_user = lp.user.to_owned();
-                    let message = stock_str::cannot_login(context, &imap_user);
-
-                    warn!(context, "IMAP failed to login: {err:#}.");
-                    first_error.get_or_insert(format_err!("{message} ({err:#})"));
-
-                    // If it looks like the password is wrong, send a notification:
-                    let _lock = context.wrong_pw_warning_mutex.lock().await;
-                    if err.to_string().to_lowercase().contains("authentication") {
-                        if self.authentication_failed_once
-                            && !configuring
-                            && context.get_config_bool(Config::NotifyAboutWrongPw).await?
-                        {
-                            let mut msg = Message::new_text(message);
-                            if let Err(e) = chat::add_device_msg_with_importance(
-                                context,
-                                None,
-                                Some(&mut msg),
-                                true,
-                            )
-                            .await
-                            {
-                                warn!(context, "Failed to add device message: {e:#}.");
-                            } else {
-                                context
-                                    .set_config_internal(Config::NotifyAboutWrongPw, None)
-                                    .await
-                                    .log_err(context)
-                                    .ok();
-                            }
-                        } else {
-                            self.authentication_failed_once = true;
-                        }
-                    } else {
-                        self.authentication_failed_once = false;
-                    }
+                    warn!(context, "{err:#}.");
+                    first_error.get_or_insert(err);
                 }
             }
         }
@@ -454,8 +407,7 @@ impl Imap {
     /// This creates a new IMAP connection and ensures
     /// that folders are created and IMAP capabilities are determined.
     pub(crate) async fn prepare(&mut self, context: &Context) -> Result<Session> {
-        let configuring = false;
-        let session = match self.connect(context, configuring).await {
+        let session = match self.connect(context).await {
             Ok(session) => session,
             Err(err) => {
                 self.connectivity.set_err(context, format!("{err:#}"));
@@ -470,12 +422,14 @@ impl Imap {
     ///
     /// Prefetches headers and downloads new message from the folder, moves messages away from the
     /// folder and deletes messages in the folder.
+    ///
+    /// Returns true if at least one message was fetched.
     pub async fn fetch_move_delete(
         &mut self,
         context: &Context,
         session: &mut Session,
         watch_folder: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ensure_and_debug_assert!(!watch_folder.is_empty(), "Watched folder cannot be empty");
         if !context.sql.is_open().await {
             // probably shutdown
@@ -505,7 +459,7 @@ impl Imap {
             .await
             .context("move_delete_messages")?;
 
-        Ok(())
+        Ok(msgs_fetched)
     }
 
     /// Fetches new messages.
@@ -574,6 +528,19 @@ impl Imap {
             .context("prefetch")?;
         let read_cnt = msgs.len();
         let _fetch_msgs_lock_guard = context.fetch_msgs_mutex.lock().await;
+        if let Some(stop_token) = &self.background_fetch_stop_token {
+            if stop_token.is_cancelled() {
+                // This also stops the transport that cancelled the token,
+                // so one background fetch receives at most `uids_to_prefetch` messages.
+                return Ok((0, false));
+            }
+            if read_cnt > 0 {
+                // Cancel the background fetch on the other transports,
+                // so that `background_fetch_any()` can return as soon as messages are received
+                // and the UI can show a notification.
+                stop_token.cancel();
+            }
+        }
 
         let mut uids_fetch: Vec<u32> = Vec::new();
         let mut available_post_msgs: Vec<String> = Vec::new();

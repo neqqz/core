@@ -23,7 +23,6 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 use deltachat::chat::{ChatId, ChatVisibility, MessageListOptions, MuteDuration};
-use deltachat::constants::DC_MSG_ID_LAST_SPECIAL;
 use deltachat::contact::{Contact, ContactId, Origin};
 use deltachat::context::{Context, ContextBuilder};
 use deltachat::ephemeral::Timer as EphemeralTimer;
@@ -725,7 +724,7 @@ pub unsafe extern "C" fn dc_event_get_data1_str(event: *mut dc_event_t) -> *mut 
     match event {
         EventType::IncomingWebxdcNotify { href, .. } => {
             if let Some(href) = href {
-                href.to_c_string().unwrap_or_default().into_raw()
+                href.strdup()
             } else {
                 ptr::null_mut()
             }
@@ -754,10 +753,7 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::DeletedBlobFile(msg)
         | EventType::Warning(msg)
         | EventType::Error(msg)
-        | EventType::ErrorSelfNotInGroup(msg) => {
-            let data2 = msg.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        | EventType::ErrorSelfNotInGroup(msg) => msg.strdup(),
         EventType::MsgsChanged { .. }
         | EventType::ReactionsChanged { .. }
         | EventType::IncomingMsg { .. }
@@ -791,45 +787,27 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::TransportsModified => ptr::null_mut(),
         EventType::IncomingCall {
             place_call_info, ..
-        } => {
-            let data2 = place_call_info.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        } => place_call_info.strdup(),
         EventType::OutgoingCallAccepted {
             accept_call_info, ..
-        } => {
-            let data2 = accept_call_info.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        } => accept_call_info.strdup(),
         EventType::CallEnded { .. } | EventType::EventChannelOverflow { .. } => ptr::null_mut(),
         EventType::ConfigureProgress { comment, .. } => {
             if let Some(comment) = comment {
-                comment.to_c_string().unwrap_or_default().into_raw()
+                comment.strdup()
             } else {
                 ptr::null_mut()
             }
         }
-        EventType::ImexFileWritten(file) => {
-            let data2 = file.to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
-        EventType::ConfigSynced { key } => {
-            let data2 = key.to_string().to_c_string().unwrap_or_default();
-            data2.into_raw()
-        }
+        EventType::ImexFileWritten(file) => file.strdup(),
+        EventType::ConfigSynced { key } => key.to_string().strdup(),
         EventType::WebxdcRealtimeData { data, .. } => {
             let ptr = unsafe { libc::malloc(data.len()) };
             unsafe { libc::memcpy(ptr, data.as_ptr() as *mut libc::c_void, data.len()) };
             ptr as *mut libc::c_char
         }
-        EventType::IncomingReaction { reaction, .. } => reaction
-            .as_str()
-            .to_c_string()
-            .unwrap_or_default()
-            .into_raw(),
-        EventType::IncomingWebxdcNotify { text, .. } => {
-            text.to_c_string().unwrap_or_default().into_raw()
-        }
+        EventType::IncomingReaction { reaction, .. } => reaction.as_str().strdup(),
+        EventType::IncomingWebxdcNotify { text, .. } => text.strdup(),
         #[allow(unreachable_patterns)]
         #[cfg(test)]
         _ => unreachable!("This is just to silence a rust_analyzer false-positive"),
@@ -1808,8 +1786,7 @@ pub unsafe extern "C" fn dc_set_chat_name(
     chat_id: u32,
     name: *const libc::c_char,
 ) -> libc::c_int {
-    if context.is_null() || chat_id <= constants::DC_CHAT_ID_LAST_SPECIAL.to_u32() || name.is_null()
-    {
+    if context.is_null() || chat_id <= ChatId::LAST_SPECIAL.to_u32() || name.is_null() {
         eprintln!("ignoring careless call to dc_set_chat_name()");
         return 0;
     }
@@ -1830,7 +1807,7 @@ pub unsafe extern "C" fn dc_set_chat_profile_image(
     chat_id: u32,
     image: *const libc::c_char,
 ) -> libc::c_int {
-    if context.is_null() || chat_id <= constants::DC_CHAT_ID_LAST_SPECIAL.to_u32() {
+    if context.is_null() || chat_id <= ChatId::LAST_SPECIAL.to_u32() {
         eprintln!("ignoring careless call to dc_set_chat_profile_image()");
         return 0;
     }
@@ -1992,7 +1969,7 @@ pub unsafe extern "C" fn dc_forward_msgs(
     if context.is_null()
         || msg_ids.is_null()
         || msg_cnt <= 0
-        || chat_id <= constants::DC_CHAT_ID_LAST_SPECIAL.to_u32()
+        || chat_id <= ChatId::LAST_SPECIAL.to_u32()
     {
         eprintln!("ignoring careless call to dc_forward_msgs()");
         return;
@@ -2073,7 +2050,7 @@ pub unsafe extern "C" fn dc_get_msg(context: *mut dc_context_t, msg_id: u32) -> 
     {
         Ok(msg) => msg,
         Err(_) => {
-            if msg_id <= constants::DC_MSG_ID_LAST_SPECIAL {
+            if MsgId::new(msg_id).is_special() {
                 // C-core API returns empty messages, do the same
                 message::Message::new(Viewtype::default())
             } else {
@@ -2496,7 +2473,7 @@ pub unsafe extern "C" fn dc_send_locations_to_chat(
     chat_id: u32,
     seconds: libc::c_int,
 ) {
-    if context.is_null() || chat_id <= constants::DC_CHAT_ID_LAST_SPECIAL.to_u32() || seconds < 0 {
+    if context.is_null() || chat_id <= ChatId::LAST_SPECIAL.to_u32() || seconds < 0 {
         eprintln!("ignoring careless call to dc_send_locations_to_chat()");
         return;
     }
@@ -4452,7 +4429,7 @@ fn convert_and_prune_message_ids(msg_ids: *const u32, msg_cnt: libc::c_int) -> V
     let ids = unsafe { std::slice::from_raw_parts(msg_ids, msg_cnt as usize) };
     let msg_ids: Vec<MsgId> = ids
         .iter()
-        .filter(|id| **id > DC_MSG_ID_LAST_SPECIAL)
+        .filter(|id| **id > MsgId::LAST_SPECIAL.to_u32())
         .map(|id| MsgId::new(*id))
         .collect();
 
@@ -4817,12 +4794,17 @@ pub unsafe extern "C" fn dc_accounts_background_fetch(
     accounts: *const dc_accounts_t,
     timeout_in_seconds: u64,
 ) -> libc::c_int {
-    if accounts.is_null() || timeout_in_seconds <= 2 {
+    if accounts.is_null() {
         eprintln!("ignoring careless call to dc_accounts_background_fetch()");
         return 0;
     }
 
     let accounts = unsafe { &*accounts };
+    if timeout_in_seconds <= 2 {
+        eprintln!("ignoring careless call to dc_accounts_background_fetch(): timeout too small");
+        block_on(accounts.read()).emit_event(EventType::AccountsBackgroundFetchDone);
+        return 0;
+    }
     let background_fetch_future = {
         let lock = block_on(accounts.read());
         lock.background_fetch(Duration::from_secs(timeout_in_seconds))
