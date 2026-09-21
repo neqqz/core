@@ -568,20 +568,9 @@ impl Context {
         self.scheduler.maybe_network().await;
     }
 
-    /// Deprecated, we are trying to get rid of this global setting.
-    /// It is possible to configure a profile with both chatmail relays
-    /// and classical email servers.
-    ///
-    /// Returns true if an account is on a chatmail server.
-    pub async fn is_chatmail(&self) -> Result<bool> {
-        self.get_config_bool(Config::IsChatmail).await
-    }
-
-    /// Returns maximum number of recipients a single email can be sent to.
-    pub(crate) async fn get_max_smtp_rcpt_to(&self) -> Result<u32> {
-        let Some((transport_id, param)) = ConfiguredLoginParam::load(self).await? else {
-            bail!("Not configured");
-        };
+    /// Returns maximum number of recipients a single email can be sent to
+    /// over the transport `transport_id`, which sends from `addr`.
+    pub(crate) async fn get_max_smtp_rcpt_to(&self, transport_id: u32, addr: &str) -> Result<u32> {
         let metadata_limit = self
             .metadata
             .read()
@@ -591,9 +580,7 @@ impl Context {
         if let Some(limit) = metadata_limit {
             return Ok(limit);
         }
-        if let Some(limit) =
-            crate::provider::legacy_settings_for_addr(&param.addr)?.max_smtp_rcpt_to
-        {
+        if let Some(limit) = crate::provider::legacy_settings_for_addr(addr)?.max_smtp_rcpt_to {
             return Ok(limit);
         }
         Ok(constants::DEFAULT_MAX_SMTP_RCPT_TO)
@@ -601,9 +588,13 @@ impl Context {
 
     /// Does a single round of fetching messages from all transports and returns.
     ///
-    /// Can be used even if I/O is currently stopped.
-    /// If I/O is stopped, fetches over a dedicated connection per transport
-    /// and returns as soon as one of them fetched messages.
+    /// If IO is stopped, pauses the scheduler and fetches over a dedicated connection
+    /// per transport, returning as soon as one of them fetched messages.
+    /// If IO is running, interrupts IMAP IDLE on all transports
+    /// and waits until they are done fetching.
+    ///
+    /// Does not wait for outgoing messages to be sent out,
+    /// use [`crate::accounts::Accounts::is_sending_finished`] for that.
     pub async fn background_fetch(&self) -> Result<()> {
         if !(self.is_configured().await?) {
             return Ok(());
@@ -618,8 +609,9 @@ impl Context {
         info!(self, "background_fetch started.");
 
         if self.scheduler.is_running().await {
-            self.scheduler.maybe_network().await;
-            self.wait_for_all_work_done().await;
+            self.scheduler.interrupt_inbox_idle().await;
+            let include_smtp = false;
+            self.wait_for_work_done(include_smtp).await;
         } else {
             self.scheduler.background_fetch_any(self).await?;
         }
@@ -885,13 +877,6 @@ impl Context {
             res.insert("imap_server_id", format!("{server_id:?}"));
         }
 
-        res.insert("is_chatmail", self.is_chatmail().await?.to_string());
-        res.insert(
-            "fix_is_chatmail",
-            self.get_config_bool(Config::FixIsChatmail)
-                .await?
-                .to_string(),
-        );
         res.insert(
             "is_muted",
             self.get_config_bool(Config::IsMuted).await?.to_string(),

@@ -421,7 +421,6 @@ def test_dont_move_sync_msgs(acf, direct_imap):
     addr, password = acf.get_credentials()
     ac1 = acf.get_unconfigured_account()
     ac1.set_config("bcc_self", "1")
-    ac1.set_config("fix_is_chatmail", "1")
     ac1.add_or_update_transport({"addr": addr, "password": password})
     ac1.start_io()
     ac1_direct_imap = direct_imap(ac1)
@@ -1352,6 +1351,22 @@ def test_background_fetch(acf, dc):
         snapshot = messages[-1].get_snapshot()
         if snapshot.text == "Hello again!":
             break
+
+
+def test_background_fetch_does_not_wait_for_sending(dc, acf):
+    alice, bob = acf.get_online_accounts(2)
+    alice_chat_bob = alice.create_chat(bob)
+
+    alice.stop_io()
+    text = "x" * 200_000
+    for _ in range(50):
+        alice_chat_bob.send_text(text)
+    assert not dc.is_sending_finished()
+
+    alice.start_io()
+    dc.background_fetch(50)
+    dc.wait_for_event(EventType.ACCOUNTS_BACKGROUND_FETCH_DONE)
+    assert not dc.is_sending_finished()
 
 
 def test_message_exists(acf):

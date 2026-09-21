@@ -52,10 +52,9 @@ def test_add_second_address(acf) -> None:
 
 
 def test_change_address(acf) -> None:
-    """Test Alice configuring a second transport and setting it as a primary one."""
+    """Test Alice configuring a second transport and removing the first one."""
     alice, bob = acf.get_online_accounts(2)
 
-    bob_addr = bob.get_config("configured_addr")
     bob.create_chat(alice)
 
     alice_chat_bob = alice.create_chat(bob)
@@ -65,22 +64,14 @@ def test_change_address(acf) -> None:
     sender_addr1 = msg1.sender.get_snapshot().address
 
     alice.stop_io()
-    old_alice_addr = alice.get_config("configured_addr")
+    old_alice_addr = alice.list_transports()[0]["addr"]
     alice_vcard = alice.self_contact.make_vcard()
     assert old_alice_addr in alice_vcard
     qr = acf.get_account_qr()
     alice.add_transport_from_qr(qr)
     new_alice_addr = alice.list_transports()[1]["addr"]
-    with pytest.raises(JsonRpcError):
-        # Cannot use the address that is not
-        # configured for any transport.
-        alice.set_config("configured_addr", bob_addr)
 
-    # Load old address so it is cached.
-    assert alice.get_config("configured_addr") == old_alice_addr
-    alice.set_config("configured_addr", new_alice_addr)
-    # Make sure that setting `configured_addr` invalidated the cache.
-    assert alice.get_config("configured_addr") == new_alice_addr
+    alice.delete_transport(old_alice_addr)
 
     alice_vcard = alice.self_contact.make_vcard()
     assert old_alice_addr not in alice_vcard
@@ -96,6 +87,25 @@ def test_change_address(acf) -> None:
     assert sender_addr1 != sender_addr2
     assert sender_addr1 == old_alice_addr
     assert sender_addr2 == new_alice_addr
+
+
+def test_remove_transport_keep_messages(acf) -> None:
+    """Test that deleting current sending transport keeps queued messages."""
+    alice, bob = acf.get_online_accounts(2)
+
+    qr = acf.get_account_qr()
+    alice.add_transport_from_qr(qr)
+
+    alice.stop_io()
+    alice_chat_bob = alice.create_chat(bob)
+    alice_chat_bob.send_text("Hello!")
+
+    new_alice_addr = alice.list_transports()[1]["addr"]
+    alice.delete_transport(alice.list_transports()[0]["addr"])
+    alice.start_io()
+
+    bob_msg = bob.wait_for_incoming_msg().get_snapshot()
+    assert bob_msg.sender.get_snapshot().address == new_alice_addr
 
 
 def test_download_on_demand(acf, rpcdata) -> None:
@@ -209,10 +219,6 @@ def test_transport_sync_new_as_primary(acf, log) -> None:
 
     log.section("ac1 changes the primary transport")
     ac1.set_config("configured_addr", transport2["addr"])
-    ac1.wait_for_event(EventType.TRANSPORTS_MODIFIED)
-
-    ac1_clone.wait_for_event(EventType.TRANSPORTS_MODIFIED)
-    assert ac1_clone.get_config("configured_addr") == transport1["addr"]
 
     log.section("ac1_clone receives a message via the new transport")
     ac1_chat = ac1.create_chat(bob)
@@ -383,3 +389,14 @@ def test_background_fetch_no_duplicates(acf, direct_imap, dc):
 
     dc.background_fetch(300)
     assert len(messages_with_text(alice_chat, "hello")) == 1
+
+
+def test_multitransport_mdn(acf):
+    """Test sending an MDN right after configuring two transports."""
+    alice, bob = acf.get_online_accounts(2)
+    alice.add_transport_from_qr(acf.get_account_qr())
+    alice.bring_online()
+    alice.create_chat(bob)
+    bob_msg = bob.create_chat(alice).send_text("Hello!")
+    alice.wait_for_incoming_msg().mark_seen()
+    assert bob.wait_for_event(EventType.MSG_READ).msg_id == bob_msg.id

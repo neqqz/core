@@ -715,6 +715,7 @@ mod tests {
     use crate::config::Config;
     use crate::test_utils::{TestContext, TestContextManager, alice_keypair};
     use crate::tools::SystemTime;
+    use crate::transport::add_pseudo_transport;
 
     static KEYPAIR: LazyLock<SignedSecretKey> = LazyLock::new(alice_keypair);
 
@@ -864,6 +865,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_self_generate_public() {
         let t = TestContext::new().await;
+        add_pseudo_transport(&t, "alice@example.org").await.unwrap();
         t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
             .await
             .unwrap();
@@ -874,6 +876,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_load_self_generate_secret() {
         let t = TestContext::new().await;
+        add_pseudo_transport(&t, "alice@example.org").await.unwrap();
         t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
             .await
             .unwrap();
@@ -886,6 +889,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
         use std::thread;
 
         let t = TestContext::new().await;
+        add_pseudo_transport(&t, "alice@example.org").await.unwrap();
         t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
             .await
             .unwrap();

@@ -129,6 +129,8 @@ pub(crate) struct ServerMetadata {
     /// True if we think the relay supports push notifications.
     /// This gates wether we attempt to write an encrypted device token
     /// to per-transport IMAP metadata key `/private/devicetoken`.
+    ///
+    /// Any `/shared/vendor/deltachat/` entry identifies a chatmail relay.
     pub supports_push: bool,
 
     /// ICE servers for WebRTC calls.
@@ -450,7 +452,7 @@ impl Imap {
 
         // Mark expired messages for deletion. Note that `delete_expired_imap_messages` is
         // not well optimized and should not be called before fetching.
-        delete_expired_imap_messages(context, session.transport_id(), session.is_chatmail())
+        delete_expired_imap_messages(context, session.transport_id())
             .await
             .context("delete_expired_imap_messages")?;
 
@@ -1384,6 +1386,8 @@ impl Session {
                 _ => {}
             }
         }
+        let supports_push =
+            max_smtp_rcpt_to.is_some() || iroh_relay.is_some() || ice_servers.is_some();
         let ice_servers = if let Some(ice_servers) = ice_servers {
             ice_servers
         } else {
@@ -1399,7 +1403,7 @@ impl Session {
                 admin,
                 iroh_relay,
                 max_smtp_rcpt_to,
-                supports_push: max_smtp_rcpt_to.is_some() || self.capabilities.has_xdeltapush,
+                supports_push,
                 ice_servers,
                 ice_servers_expiration_timestamp,
                 app_versions,
