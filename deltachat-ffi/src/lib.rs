@@ -527,7 +527,6 @@ pub unsafe extern "C" fn dc_event_get_id(event: *mut dc_event_t) -> libc::c_int 
         EventType::ImapConnected(_) => 102,
         EventType::SmtpMessageSent(_) => 103,
         EventType::ImapMessageDeleted(_) => 104,
-        EventType::ImapMessageMoved(_) => 105,
         EventType::ImapInboxIdle => 106,
         EventType::NewBlobFile(_) => 150,
         EventType::DeletedBlobFile(_) => 151,
@@ -594,7 +593,6 @@ pub unsafe extern "C" fn dc_event_get_data1_int(event: *mut dc_event_t) -> libc:
         | EventType::ImapConnected(_)
         | EventType::SmtpMessageSent(_)
         | EventType::ImapMessageDeleted(_)
-        | EventType::ImapMessageMoved(_)
         | EventType::ImapInboxIdle
         | EventType::NewBlobFile(_)
         | EventType::DeletedBlobFile(_)
@@ -669,7 +667,6 @@ pub unsafe extern "C" fn dc_event_get_data2_int(event: *mut dc_event_t) -> libc:
         | EventType::ImapConnected(_)
         | EventType::SmtpMessageSent(_)
         | EventType::ImapMessageDeleted(_)
-        | EventType::ImapMessageMoved(_)
         | EventType::ImapInboxIdle
         | EventType::NewBlobFile(_)
         | EventType::DeletedBlobFile(_)
@@ -764,7 +761,6 @@ pub unsafe extern "C" fn dc_event_get_data2_str(event: *mut dc_event_t) -> *mut 
         | EventType::ImapConnected(msg)
         | EventType::SmtpMessageSent(msg)
         | EventType::ImapMessageDeleted(msg)
-        | EventType::ImapMessageMoved(msg)
         | EventType::NewBlobFile(msg)
         | EventType::DeletedBlobFile(msg)
         | EventType::Warning(msg)
@@ -4078,13 +4074,13 @@ pub unsafe extern "C" fn dc_contact_get_last_seen(contact: *mut dc_contact_t) ->
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dc_contact_was_seen_recently(contact: *mut dc_contact_t) -> libc::c_int {
+pub unsafe extern "C" fn dc_contact_get_freshness(contact: *mut dc_contact_t) -> libc::c_int {
     if contact.is_null() {
-        eprintln!("ignoring careless call to dc_contact_was_seen_recently()");
+        eprintln!("ignoring careless call to dc_contact_get_freshness()");
         return 0;
     }
     let ffi_contact = unsafe { &*contact };
-    ffi_contact.contact.was_seen_recently() as libc::c_int
+    u32::from(ffi_contact.contact.get_freshness()) as libc::c_int
 }
 
 #[unsafe(no_mangle)]
