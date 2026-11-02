@@ -125,15 +125,15 @@ pub trait DcKey: Serialize + Deserializable + Clone {
 }
 
 /// Converts secret key to public key.
+///
+/// `addr` is the address used in the User ID which is generated for compatibility.
+/// `relay_addrs` is the comma-separated list of relay addresses.
 pub(crate) fn secret_key_to_public_key(
-    context: &Context,
     mut signed_secret_key: SignedSecretKey,
     timestamp: u32,
     addr: &str,
     relay_addrs: &str,
 ) -> Result<SignedPublicKey> {
-    info!(context, "Converting secret key to public key.");
-
     // Make sure timestamp of created signatures
     // is not in the past compared to the primary key timestamp.
     let timestamp = std::cmp::max(
@@ -306,7 +306,7 @@ pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option
     let addr = context.get_primary_self_addr().await?;
     let all_addrs = context.get_self_addrs().await?.join(",");
     let signed_public_key =
-        secret_key_to_public_key(context, signed_secret_key, timestamp, &addr, &all_addrs)?;
+        secret_key_to_public_key(signed_secret_key, timestamp, &addr, &all_addrs)?;
     *lock = Some(signed_public_key.clone());
 
     Ok(Some(signed_public_key))
@@ -713,7 +713,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::Config;
     use crate::test_utils::{TestContext, TestContextManager, alice_keypair};
     use crate::tools::SystemTime;
     use crate::transport::add_pseudo_transport;
@@ -867,9 +866,6 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     async fn test_load_self_generate_public() {
         let t = TestContext::new().await;
         add_pseudo_transport(&t, "alice@example.org").await.unwrap();
-        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
-            .await
-            .unwrap();
         let key = load_self_public_key(&t).await;
         assert!(key.is_ok());
     }
@@ -878,9 +874,6 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     async fn test_load_self_generate_secret() {
         let t = TestContext::new().await;
         add_pseudo_transport(&t, "alice@example.org").await.unwrap();
-        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
-            .await
-            .unwrap();
         let key = load_self_secret_key(&t).await;
         assert!(key.is_ok());
     }
@@ -891,9 +884,6 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
 
         let t = TestContext::new().await;
         add_pseudo_transport(&t, "alice@example.org").await.unwrap();
-        t.set_config(Config::ConfiguredAddr, Some("alice@example.org"))
-            .await
-            .unwrap();
         let thr0 = {
             let ctx = t.clone();
             thread::spawn(move || {

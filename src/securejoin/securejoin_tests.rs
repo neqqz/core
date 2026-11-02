@@ -50,11 +50,7 @@ async fn test_setup_contact_ext(case: SetupContactCase) -> (TestContext, TestCon
 
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
-    let alice_addr = &alice
-        .get_config(Config::ConfiguredAddr)
-        .await
-        .unwrap()
-        .unwrap();
+    let alice_addr = alice.get_primary_self_addr().await.unwrap();
     if case == SetupContactCase::AliceHasName {
         alice
             .set_config(Config::Displayname, Some("Alice"))
@@ -118,7 +114,7 @@ async fn test_setup_contact_ext(case: SetupContactCase) -> (TestContext, TestCon
     let contact_alice_id = bob.add_or_lookup_contact_no_key(&alice).await.id;
     let sent = bob.pop_sent_msg().await;
     assert!(!sent.payload.contains("Bob Examplenet"));
-    assert_eq!(sent.recipient(), EmailAddress::new(alice_addr).unwrap());
+    assert_eq!(sent.recipients, *alice_addr);
     let msg = alice.parse_msg(&sent).await;
     assert!(msg.signature.is_none());
     assert_eq!(
@@ -1160,12 +1156,12 @@ async fn test_get_securejoin_qr_encoding() -> Result<()> {
 
     let qr = get_securejoin_qr(alice, None).await?;
     assert!(
-        qr.contains("a=jk%25l@example.net"),
-        "{qr} doesn't contain 'a=jk%25l@example.net'"
+        qr.contains("a=jk%25l%40example.net"),
+        "{qr} doesn't contain 'a=jk%25l%40example.net'"
     );
     assert!(
-        qr.contains("r=asdf@example.org,alice@example.org"),
-        "{qr} doesn't contain 'r=asdf@example.org,alice@example.org'"
+        qr.contains("r=asdf%40example.org,alice%40example.org"),
+        "{qr} doesn't contain 'r=asdf%40example.org,alice%40example.org'"
     );
 
     let qr = check_qr(bob, &qr).await?;

@@ -37,8 +37,8 @@ use crate::sync::Sync::Nosync;
 use crate::tools::time;
 use crate::transport::{
     ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
-    ConnectionCandidate, delete_transport_row, maybe_update_sending_transport,
-    purge_transport_caches, send_sync_transports, transport_addrs,
+    ConnectionCandidate, delete_transport_row, purge_transport_caches, send_sync_transports,
+    transport_addrs, update_configured_addr,
 };
 use crate::{EventType, autorelay, stock_str};
 
@@ -275,7 +275,7 @@ impl Context {
     /// another one is chosen automatically.
     pub async fn delete_transport(&self, addr: &str) -> Result<()> {
         let now = time();
-        let (removed_transport_id, reelected) = self
+        let removed_transport_id = self
             .sql
             .transaction(|transaction| {
                 if transport_addrs(transaction)?.len() <= 1 {
@@ -294,14 +294,10 @@ impl Context {
                 let remove_timestamp = std::cmp::max(now, add_timestamp);
                 let transport_id = delete_transport_row(transaction, addr, remove_timestamp)?
                     .context("Transport disappeared")?;
-                let reelected = maybe_update_sending_transport(transaction)?;
-                Ok((transport_id, reelected))
+                update_configured_addr(transaction)?;
+                Ok(transport_id)
             })
             .await?;
-        if let Some(new_addr) = reelected {
-            info!(self, "Using transport {new_addr:?} for sending now.");
-            self.sql.uncache_raw_config("configured_addr").await;
-        }
         send_sync_transports(self).await?;
         purge_transport_caches(self, removed_transport_id).await;
         // Restarting all IO also stops the removed transport's IMAP loop.
@@ -513,6 +509,8 @@ pub(crate) async fn configure(
         let smtp_password = configured_param.smtp_password.clone();
         let smtp_addr = configured_param.addr.clone();
 
+        let transport_id = 0;
+
         let proxy_config2 = proxy_config.clone();
         let smtp_config_task = task::spawn(async move {
             let mut smtp = Smtp::new();
@@ -522,6 +520,7 @@ pub(crate) async fn configure(
                 &smtp_password,
                 &proxy_config2,
                 &smtp_addr,
+                transport_id,
                 strict_tls,
             )
             .await?;
@@ -533,7 +532,6 @@ pub(crate) async fn configure(
 
         // Configure IMAP
 
-        let transport_id = 0;
         let (_s, r) = async_channel::bounded(1);
         let mut imap = Imap::new(ctx, transport_id, configured_param.clone(), r).await?;
         let imap_session = match imap.connect(ctx).await {
@@ -799,8 +797,6 @@ mod tests {
         let t = &tcm.unconfigured().await;
 
         add_pseudo_transport(t, "primary@example.org").await?;
-        t.set_config(Config::ConfiguredAddr, Some("primary@example.org"))
-            .await?;
         assert_eq!(t.count_transports().await?, 1);
         t.check_relay_limit().await?;
 

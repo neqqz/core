@@ -2687,6 +2687,32 @@ CREATE TABLE smtp_success (
         .await?;
     }
 
+    inc_and_check(&mut migration_version, 169)?;
+    if dbversion < migration_version {
+        sql.execute_migration(
+            "
+CREATE TABLE smtp_failure (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    transport_id INTEGER UNIQUE NOT NULL,
+    FOREIGN KEY(transport_id) REFERENCES transports(id) ON DELETE CASCADE
+) STRICT;
+",
+            migration_version,
+        )
+        .await?;
+    }
+
+    inc_and_check(&mut migration_version, 170)?;
+    if dbversion < migration_version {
+        // Lets `delete_messages()` find rows marked for deletion without reading the folder's rows.
+        sql.execute_migration(
+            "CREATE INDEX IF NOT EXISTS imap_pending_deletions
+             ON imap(transport_id, folder) WHERE target != folder",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?

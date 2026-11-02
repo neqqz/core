@@ -389,9 +389,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
 /**
  * Configure the context. The configuration is handled by key=value pairs as:
  *
- * - `configured_addr` = Email address in use.
- *                    Unless for testing, do not set this value using dc_set_config().
- *                    Instead, set `addr` and call dc_configure().
  * - `displayname`  = Own name to use when sending messages. MUAs are allowed to spread this way e.g. using CC, defaults to empty
  * - `selfstatus`   = Own status to display, e.g. in e-mail footers, defaults to empty
  * - `selfavatar`   = File containing avatar. Will immediately be copied to the 
@@ -468,9 +465,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    e.g. `ui.desktop.foo`, `ui.desktop.linux.bar`, `ui.android.foo`, `ui.dc40.bar`, `ui.bot.simplebot.baz`.
  *                    These keys go to backups and allow easy per-account settings when using @ref dc_accounts_t,
  *                    however, are not handled by the core otherwise.
- * - `webxdc_realtime_enabled` = Whether the realtime APIs should be enabled.
- *                               0 = WebXDC realtime API is disabled and behaves as noop.
- *                               1 = WebXDC realtime API is enabled (default).
  * - `who_can_call_me` = Who can cause call notifications.
  *                       0 = Everybody (except explicitly blocked contacts),
  *                       1 = Contacts (default, does not include contact requests),
@@ -481,8 +475,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * if you want to use the deprecated dc_configure() API, such as:
  *
  * - `addr`         = Email address to use for configuration.
- *                    If dc_configure() fails this is not the email address actually in use.
- *                    Use `configured_addr` to find out the email address actually in use.
  * - `mail_server`  = IMAP-server, guessed if left out
  * - `mail_user`    = IMAP-username, guessed if left out
  * - `mail_pw`      = IMAP-password (always needed)
@@ -2626,8 +2618,6 @@ char*           dc_get_securejoin_qr_svg         (dc_context_t* context, uint32_
  * During the handshake, info messages are added to the chat,
  * showing progress, success or errors.
  *
- * Subsequent calls of dc_join_securejoin() will abort previous, unfinished handshakes.
- *
  * See https://securejoin.delta.chat/ for details about both protocols.
  *
  * @memberof dc_context_t
@@ -4491,6 +4481,7 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
  * - DC_INFO_GROUP_DESCRIPTION_CHANGED (70) - Info-message "Description changed", UI should open the profile with the description
  * - DC_INFO_MESSAGE_PINNED (71) - Message pinned, UI should scroll to the pinned message returned by dc_msg_get_parent()
+ * - DC_INFO_MESSAGE_UNPINNED (72) - Message unpinned, UI should scroll to the pinned message returned by dc_msg_get_parent()
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -4551,6 +4542,7 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_CHAT_E2EE                 50
 #define         DC_INFO_GROUP_DESCRIPTION_CHANGED 70
 #define         DC_INFO_MESSAGE_PINNED            71
+#define         DC_INFO_MESSAGE_UNPINNED          72
 
 
 /**
@@ -6488,7 +6480,7 @@ void dc_event_unref(dc_event_t* event);
  * The event is emitted on the device modifying the transports
  * as well as on other devices applying the synced change,
  * for the JSON-RPC calls `add_or_update_transport`, `add_transport_from_qr`,
- * `delete_transport` or `set_config(configured_addr)`.
+ * `delete_transport`.
  */
 #define DC_EVENT_TRANSPORTS_MODIFIED           2600
 
@@ -7288,6 +7280,12 @@ void dc_event_unref(dc_event_t* event);
 
 /// @deprecated 2026-08-31
 #define DC_STR_PHASING_OUT 245
+
+/// "You unpinned a message."
+#define DC_STR_MESSAGE_UNPINNED_BY_YOU 246
+
+/// "Message unpinned by %1$s."
+#define DC_STR_MESSAGE_UNPINNED_BY_OTHER 247
 
 /**
  * @}

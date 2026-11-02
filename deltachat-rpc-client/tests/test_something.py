@@ -100,7 +100,6 @@ def test_lowercase_address(acf) -> None:
     )
     assert account.is_configured()
     assert addr_upper != addr
-    assert account.get_config("configured_addr") == addr
     assert account.list_transports()[0]["addr"] == addr
 
     param = account.get_info()["used_transport_settings"]
@@ -168,7 +167,7 @@ def test_list_transports(acf) -> None:
 def test_account(acf) -> None:
     alice, bob = acf.get_online_accounts(2)
 
-    bob_addr = bob.get_config("configured_addr")
+    bob_addr = bob.list_transports()[0]["addr"]
     alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("Hello!")
@@ -331,7 +330,7 @@ def test_chat(acf) -> None:
 def test_contact(acf) -> None:
     alice, bob = acf.get_online_accounts(2)
 
-    bob_addr = bob.get_config("configured_addr")
+    bob_addr = bob.list_transports()[0]["addr"]
     alice_contact_bob = alice.create_contact(bob, "Bob")
 
     assert alice_contact_bob == alice.get_contact_by_id(alice_contact_bob.id)
@@ -1489,3 +1488,19 @@ def test_is_sending_finished(dc, acf) -> None:
     bob.wait_for_event(EventType.SMTP_MESSAGE_SENT)
 
     assert dc.is_sending_finished()
+
+
+def test_pseudo_transport_start_stop_io(acf):
+    """
+    Test that I/O can be started and stopped for pseudo transport.
+
+    Pseudo transport has no connection candidates,
+    so in the past this resulted in IMAP busy looping
+    and stop_io() failing to even cancel the loop sometimes.
+    This is a regression test for this bug.
+    """
+    for i in range(10):
+        alice = acf.get_unconfigured_account()
+        alice.add_pseudo_transport(f"alice{i}@example.net")
+        alice.start_io()
+        alice.stop_io()

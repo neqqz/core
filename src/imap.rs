@@ -16,8 +16,7 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure, format_err};
 use async_channel::{self, Receiver, Sender};
 use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
-use futures::{FutureExt as _, TryStreamExt};
-use futures_lite::FutureExt;
+use futures::TryStreamExt as _;
 use ratelimit::Ratelimit;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -62,6 +61,20 @@ const RFC724MID_UID: &str = "(UID BODY.PEEK[HEADER.FIELDS (\
                              X-MICROSOFT-ORIGINAL-MESSAGE-ID\
                              )])";
 const BODY_FULL: &str = "(FLAGS BODY.PEEK[])";
+
+const PENDING_DELETIONS: &str = "
+    SELECT id, uid, target FROM imap
+    WHERE folder = ?
+    AND transport_id = ?
+    AND target != folder
+    ORDER BY target, uid";
+
+/// `CROSS JOIN` loops over the few `imap_markseen` rows, not over the transport's `imap` rows.
+const PENDING_SEEN_FLAGS: &str = "
+    SELECT imap.id, uid, folder FROM imap_markseen CROSS JOIN imap
+    WHERE imap.id = imap_markseen.id
+    AND imap.transport_id=?
+    AND target = folder";
 
 #[derive(Debug)]
 pub(crate) struct Imap {
@@ -274,17 +287,27 @@ impl Imap {
                 "IMAP got rate limited, waiting for {} until can connect.",
                 duration_to_str(ratelimit_duration),
             );
-            let interrupted = async {
-                tokio::time::sleep(ratelimit_duration).await;
-                false
-            }
-            .race(self.idle_interrupt_receiver.recv().map(|_| true))
-            .await;
-            if interrupted {
-                info!(
-                    context,
-                    "Connecting to IMAP without waiting for ratelimit due to interrupt."
-                );
+            match tokio::time::timeout(ratelimit_duration, self.idle_interrupt_receiver.recv())
+                .await
+            {
+                Ok(Ok(())) => {
+                    info!(
+                        context,
+                        "Connecting to IMAP without waiting for ratelimit due to interrupt."
+                    );
+                }
+                Ok(Err(async_channel::RecvError)) => {
+                    // If we get a RecvError, then this is likely because
+                    // the scheduler dropped the sender as it is stopping I/O.
+                    // Returning an error right away would make inbox_loop() call prepare() again.
+                    // Sleeping gives the executor a chance to cancel the loop;
+                    // the exact duration does not matter.
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    bail!("Not connecting to IMAP because interrupt channel is closed");
+                }
+                Err(_) => {
+                    // Rate limit duration has passed.
+                }
             }
         }
 
@@ -301,6 +324,11 @@ impl Imap {
         self.conn_backoff_ms = max(BACKOFF_MIN_MS, self.conn_backoff_ms);
 
         let login_params = prioritize_server_login_params(&context.sql, &self.lp, "imap").await?;
+        if login_params.is_empty() {
+            // Count one connection attempt so we don't busy loop.
+            self.ratelimit.send();
+        }
+
         let mut first_connection_error = None;
         let mut first_login_error = None;
         'candidate: for lp in login_params {
@@ -453,8 +481,7 @@ impl Imap {
             context.scheduler.interrupt_ephemeral_task().await;
         }
 
-        // Mark expired messages for deletion. Note that `delete_expired_imap_messages` is
-        // not well optimized and should not be called before fetching.
+        // Mark messages for deletion on the server.
         delete_expired_imap_messages(context, session.transport_id())
             .await
             .context("delete_expired_imap_messages")?;
@@ -854,20 +881,12 @@ impl Session {
         let transport_id = self.transport_id();
         let rows = context
             .sql
-            .query_map_vec(
-                "SELECT id, uid, target FROM imap
-                 WHERE folder = ?
-                 AND transport_id = ?
-                 AND target != folder
-                 ORDER BY target, uid",
-                (folder, transport_id),
-                |row| {
-                    let rowid: i64 = row.get(0)?;
-                    let uid: u32 = row.get(1)?;
-                    let target: String = row.get(2)?;
-                    Ok((rowid, uid, target))
-                },
-            )
+            .query_map_vec(PENDING_DELETIONS, (folder, transport_id), |row| {
+                let rowid: i64 = row.get(0)?;
+                let uid: u32 = row.get(1)?;
+                let target: String = row.get(2)?;
+                Ok((rowid, uid, target))
+            })
             .await?;
 
         for (target, rowid_set, uid_set) in UidGrouper::from(rows) {
@@ -916,19 +935,12 @@ impl Session {
         let transport_id = self.transport_id();
         let mut rows = context
             .sql
-            .query_map_vec(
-                "SELECT imap.id, uid, folder FROM imap, imap_markseen
-                 WHERE imap.id = imap_markseen.id
-                 AND imap.transport_id=?
-                 AND target = folder",
-                (transport_id,),
-                |row| {
-                    let rowid: i64 = row.get(0)?;
-                    let uid: u32 = row.get(1)?;
-                    let folder: String = row.get(2)?;
-                    Ok((rowid, uid, folder))
-                },
-            )
+            .query_map_vec(PENDING_SEEN_FLAGS, (transport_id,), |row| {
+                let rowid: i64 = row.get(0)?;
+                let uid: u32 = row.get(1)?;
+                let folder: String = row.get(2)?;
+                Ok((rowid, uid, folder))
+            })
             .await?;
 
         // Number of SQL results is expected to be low as
@@ -1579,16 +1591,21 @@ pub(crate) async fn prefetch_should_download(
 /// Schedule marking the message as Seen on IMAP by adding all known IMAP messages corresponding to
 /// the given Message-ID to `imap_markseen` table.
 pub(crate) async fn markseen_on_imap_table(context: &Context, message_id: &str) -> Result<()> {
-    context
-        .sql
-        .execute(
-            "INSERT OR IGNORE INTO imap_markseen (id)
-             SELECT id FROM imap WHERE rfc724_mid=?",
-            (message_id,),
-        )
+    let sql = &context.sql;
+    sql.transaction(|tx| insert_imap_markseen(tx, message_id))
         .await?;
     context.scheduler.interrupt_inbox().await;
 
+    Ok(())
+}
+
+/// Like [`markseen_on_imap_table`], but leaves interrupting the inbox loop to the caller.
+pub(crate) fn insert_imap_markseen(tx: &rusqlite::Transaction, message_id: &str) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO imap_markseen (id)
+         SELECT id FROM imap WHERE rfc724_mid=?",
+        (message_id,),
+    )?;
     Ok(())
 }
 

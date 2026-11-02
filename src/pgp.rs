@@ -1,5 +1,6 @@
 //! OpenPGP helper module using [rPGP facilities](https://github.com/rpgp/rpgp).
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
@@ -227,23 +228,57 @@ pub(crate) fn create_pq_signing_keypair(addr: EmailAddress) -> Result<SignedSecr
 /// whose keys both carry a PQ subkey, with automatic per-recipient fallback
 /// to classic otherwise — no coordination or setting needed on either side.
 ///
+/// The key is selected according to
+/// <https://www.ietf.org/archive/id/draft-autocrypt-openpgp-v2-cert-03.html#section-4.3-4>.
+/// If multiple keys are available, the one that will expire sooner is selected.
+///
 /// Returns `None` if the public key cannot be used for encryption.
 ///
-/// TODO: take key flags and expiration dates into account
-fn select_pk_for_encryption(key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
-    let mut fallback: Option<&SignedPublicSubKey> = None;
-    for subkey in key.public_subkeys.iter() {
-        if !subkey.algorithm().can_encrypt() {
-            continue;
-        }
-        if classify_encryption_algorithm(subkey.algorithm()) == EncryptionKind::PostQuantum {
-            return Some(subkey);
-        }
-        if fallback.is_none() {
-            fallback = Some(subkey);
-        }
-    }
-    fallback
+/// Subkeys without the encrypt-comms flag and expired subkeys are skipped.
+/// A post-quantum subkey is always preferred over a classic one; among
+/// subkeys of the same kind the one that expires sooner is selected.
+fn select_pk_for_encryption(now: u32, key: &SignedPublicKey) -> Option<&SignedPublicSubKey> {
+    let expiry = |subkey: &SignedPublicSubKey, signature: &Signature| {
+        signature
+            .key_expiration_time()
+            .filter(|duration| duration.as_secs() != 0)
+            .map(|duration| subkey.created_at().as_secs().saturating_add(duration.as_secs()))
+    };
+    key.public_subkeys
+        .iter()
+        .filter(|subkey| subkey.algorithm().can_encrypt())
+        .filter_map(|subkey| {
+            // We take arbitrary signature here and don't try to select the newest one.
+            // Filtering out outdated and invalid signatures should happen during certificate merging.
+            let signature = subkey.signatures.first()?;
+
+            if !signature.key_flags().encrypt_comms() {
+                return None;
+            }
+
+            if let Some(expires_at) = expiry(subkey, signature)
+                && now > expires_at
+            {
+                // Key is expired.
+                return None;
+            }
+            Some((subkey, signature))
+        })
+        .min_by(|(subkey1, signature1), (subkey2, signature2)| {
+            let pq = |subkey: &SignedPublicSubKey| {
+                classify_encryption_algorithm(subkey.algorithm()) == EncryptionKind::PostQuantum
+            };
+            // `true` (post-quantum) sorts first.
+            pq(subkey2).cmp(&pq(subkey1)).then_with(|| {
+                match (expiry(subkey1, signature1), expiry(subkey2, signature2)) {
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                    (Some(e1), Some(e2)) => e1.cmp(&e2),
+                }
+            })
+        })
+        .map(|(subkey, _signature)| subkey)
 }
 
 /// Coarse classification of the algorithm family behind a key's chosen
@@ -300,7 +335,8 @@ fn classify_encryption_algorithm(
 /// would pick for this public key (i.e. what you'd use to encrypt *to* this key),
 /// or `None` if the key has no usable encryption subkey.
 pub fn encryption_kind(key: &SignedPublicKey) -> Option<EncryptionKind> {
-    select_pk_for_encryption(key).map(|subkey| classify_encryption_algorithm(subkey.algorithm()))
+    select_pk_for_encryption(pgp::types::Timestamp::now().as_secs(), key)
+        .map(|subkey| classify_encryption_algorithm(subkey.algorithm()))
 }
 
 /// Same as [`encryption_kind`], but for one of our own secret keys — used to
@@ -501,12 +537,13 @@ pub enum SeipdVersion {
 /// encrypted to `public_keys_for_encryption`.
 #[expect(clippy::arithmetic_side_effects)]
 fn signature_subpackets(
+    now: pgp::types::Timestamp,
     private_key_for_signing: &SignedSecretKey,
     public_keys_for_encryption: &[SignedPublicKey],
 ) -> Result<SubpacketConfig> {
     let mut hashed = Vec::with_capacity(1 + public_keys_for_encryption.len() + 1);
     hashed.push(Subpacket::critical(SubpacketData::SignatureCreationTime(
-        pgp::types::Timestamp::now(),
+        now,
     ))?);
     for key in public_keys_for_encryption {
         let data = SubpacketData::IntendedRecipientFingerprint(key.fingerprint());
@@ -542,10 +579,11 @@ pub fn pk_encrypt(
 ) -> Result<String> {
     tokio::task::block_in_place(|| {
         let mut rng = thread_rng();
+        let now = pgp::types::Timestamp::now();
 
         let pkeys = public_keys_for_encryption
             .iter()
-            .filter_map(select_pk_for_encryption);
+            .filter_map(|key| select_pk_for_encryption(now.as_secs(), key));
 
         let msg = MessageBuilder::from_bytes("", plain);
         let encoded_msg = match seipd_version {
@@ -557,7 +595,8 @@ pub fn pk_encrypt(
                 }
 
                 if let Some(secret_key) = private_key_for_signing {
-                    let subpkts = signature_subpackets(secret_key, &public_keys_for_encryption)?;
+                    let subpkts =
+                        signature_subpackets(now, secret_key, &public_keys_for_encryption)?;
                     let hash_algorithm = secret_key.hash_alg();
                     msg.sign_with_subpackets(
                         &**secret_key,
@@ -585,7 +624,8 @@ pub fn pk_encrypt(
                 }
 
                 if let Some(secret_key) = private_key_for_signing {
-                    let subpkts = signature_subpackets(secret_key, &public_keys_for_encryption)?;
+                    let subpkts =
+                        signature_subpackets(now, secret_key, &public_keys_for_encryption)?;
                     let hash_algorithm = secret_key.hash_alg();
                     msg.sign_with_subpackets(
                         &**secret_key,
@@ -717,6 +757,8 @@ pub fn symm_encrypt_message(
 /// or even have some packets maliciously dropped
 /// (for example, all encryption subkeys dropped)
 /// or restored from some older version of the certificate.
+///
+/// In case of ties, i.e. same timestamps, data from the new certificate is preferred.
 pub fn merge_openpgp_certificates(
     old_certificate: SignedPublicKey,
     new_certificate: SignedPublicKey,
@@ -876,7 +918,8 @@ pub(crate) fn relay_addrs(public_key: &SignedPublicKey, addr: &str) -> Vec<Strin
 
 /// Returns true if the key can be encrypted to, i.e. has an encryption subkey.
 pub(crate) fn pubkey_can_encrypt(public_key: &SignedPublicKey) -> bool {
-    select_pk_for_encryption(public_key).is_some()
+    let now = pgp::types::Timestamp::now();
+    select_pk_for_encryption(now.as_secs(), public_key).is_some()
 }
 
 /// Returns true if public key advertises SEIPDv2 feature.
